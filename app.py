@@ -12,10 +12,10 @@ import tensorflow as tf
 from PIL import Image, ImageDraw
 
 # ================================
-# PART 0: Load UNet model
+# Load UNet model
 # ================================
 
-UNET_PATH = "fetal_unet_model.h5"  # put your model in the same folder
+UNET_PATH = "fetal_unet_model.h5"
 if not os.path.exists(UNET_PATH):
     st.error(f"Model not found at {UNET_PATH}. Upload your fetal_unet_model.h5 to this path or change UNET_PATH.")
     st.stop()
@@ -24,12 +24,13 @@ unet_model = tf.keras.models.load_model(UNET_PATH, compile=False)
 st.success(f"✅ UNet model loaded from: {UNET_PATH}")
 
 # ================================
-# PART 1: Constants & Helpers
+# Constants & Helpers
 # ================================
 
 IMG_SIZE = 256
 COLORS = {1: (0, 0, 255), 2: (0, 255, 255), 3: (255, 0, 0)}
 
+# Intergrowth table for HC
 INTERGROWTH_HC = {
     14: (87.38, 88.69, 90.73, 97.88, 105.02, 107.06, 108.37),
     15: (99.22,100.61,102.78,110.37,117.97,120.13,121.53),
@@ -88,7 +89,7 @@ def hc_to_z_percentile(hc_mm, ga_weeks):
     return {'z': z, 'pct': pct, 'median': p50, 'sd': sd, 'centiles': cent}
 
 # ================================
-# PART 2: HC & CSP/LV Helpers
+# Segmentation & Measurement Functions
 # ================================
 
 def calculate_hc_from_segmentation(mask, pixel_size_mm, original_height=None):
@@ -103,14 +104,7 @@ def calculate_hc_from_segmentation(mask, pixel_size_mm, original_height=None):
     ellipse = None
     if len(largest_contour) >= 5:
         ellipse = cv2.fitEllipse(largest_contour)
-        (center, axes, orientation) = ellipse
-        major_axis, minor_axis = max(axes)/2.0, min(axes)/2.0
-        h = ((major_axis - minor_axis) * 2) / ((major_axis + minor_axis) * 2 + 1e-10)
-        circumference_pixels = math.pi * (major_axis + minor_axis) * (1 + (3*h)/(10 + math.sqrt(4-3*h)))
-        perimeter_pixels = cv2.arcLength(largest_contour, True)
-        hc_pixels = (circumference_pixels + perimeter_pixels)/2.0
-    else:
-        hc_pixels = cv2.arcLength(largest_contour, True)
+    hc_pixels = cv2.arcLength(largest_contour, True)
     if original_height and original_height != IMG_SIZE:
         hc_pixels *= original_height / IMG_SIZE
     hc_mm = hc_pixels * pixel_size_mm
@@ -126,20 +120,18 @@ def apply_unet_for_hc(image_bgr, pixel_size_mm):
     else:
         pr = pred[:,:,0] if pred.ndim==3 else pred
         pred_mask = (pr>0.5).astype(np.uint8)
-    unique_classes = np.unique(pred_mask)
     mask_color = np.zeros((IMG_SIZE,IMG_SIZE,3), dtype=np.uint8)
     for cls, col in COLORS.items(): mask_color[pred_mask==cls] = col
     hc_mm, contour, ellipse = calculate_hc_from_segmentation(pred_mask, pixel_size_mm, original_h)
     overlay = cv2.addWeighted(image_resized,0.6,mask_color,0.4,0)
     if contour is not None: cv2.drawContours(overlay,[contour],-1,(0,255,0),2)
     if ellipse is not None: cv2.ellipse(overlay, ellipse,(0,255,255),2)
-    return image_resized, mask_color, overlay, pred_mask, hc_mm, unique_classes
+    return image_resized, mask_color, overlay, pred_mask, hc_mm
 
 def apply_unet_for_csp_ventricles(image_array):
     image_resized = cv2.resize(image_array, (IMG_SIZE, IMG_SIZE))
     image_norm = image_resized.astype(np.float32) / 255.0
-    image_input = np.expand_dims(image_norm, 0)
-    pred_mask = unet_model.predict(image_input, verbose=0)[0]
+    pred_mask = unet_model.predict(np.expand_dims(image_norm, 0), verbose=0)[0]
     pred_mask = np.argmax(pred_mask, axis=-1).astype(np.uint8)
     mask_color = np.zeros((IMG_SIZE, IMG_SIZE, 3), np.uint8)
     for cls, col in COLORS.items(): mask_color[pred_mask == cls] = col
@@ -157,9 +149,8 @@ def analyse_anomalies(csp_pixels, lv_pixels, week, pixel_to_mm):
     diagnostics = []
     status = "NORMAL"
     status_color = "green"
-    # --- Example rules (can add more) ---
     if lv_diameter_mm > 10: 
-        diagnostics.append(f"⚠️ Ventricular enlargement: LV={lv_diameter_mm:.1f} mm")
+        diagnostics.append(f"⚠ Ventricular enlargement: LV={lv_diameter_mm:.1f} mm")
         status = "ANORMAL"; status_color="orange"
     if csp_diameter_mm == 0:
         diagnostics.append("❌ CSP NON VISIBLE (18-37 sem) → SUSPICION DE MALFORMATION")
@@ -171,75 +162,70 @@ def analyse_anomalies(csp_pixels, lv_pixels, week, pixel_to_mm):
     return diagnostics, status, status_color, lv_diameter_mm, csp_diameter_mm
 
 # ================================
-# PART 3: Streamlit UI
+# Streamlit UI
 # ================================
 
 st.set_page_config(page_title="Fetal Brain Analysis", layout="wide")
 st.markdown("<h1 style='text-align:center; color:#4a6fa5;'>🧠 Fetal Brain Analysis System</h1>", unsafe_allow_html=True)
 st.markdown("<p style='text-align:center;'>UNet Segmentation • HC Measurement • CSP/Ventricular Analysis</p>", unsafe_allow_html=True)
 
-# Sidebar inputs
 st.sidebar.header("Upload & Parameters")
 uploaded_file = st.sidebar.file_uploader("Upload Ultrasound Image", type=['jpg','jpeg','png','bmp','tif'])
 pixel_size = st.sidebar.number_input("Pixel size (mm)", value=0.219544094, step=0.0001)
 ga_weeks = st.sidebar.number_input("Gestational age (weeks)", value=28.0, step=0.1)
 process_btn = st.sidebar.button("Process & Analyze")
 
-# Main columns for outputs
-hc_col, csp_col = st.columns([2, 3])
+if process_btn and uploaded_file is not None:
+    try:
+        pil = Image.open(uploaded_file).convert("RGB")
+        img_rgb = np.array(pil)
+        img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
 
-if process_btn:
-    if uploaded_file is None:
-        st.sidebar.error("❌ Please upload an image first!")
-    else:
-        try:
-            pil = Image.open(uploaded_file).convert("RGB")
-            img_rgb = np.array(pil)
-            img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
+        st.markdown(f"📄 **Processing:** {uploaded_file.name}")
+        st.markdown(f"   Pixel size (mm): {pixel_size}")
+        st.markdown(f"   Gestational age (wks): {ga_weeks:.2f}")
+        st.markdown("🔍 Running HC segmentation and measurements...")
 
-            st.markdown(f"📄 **Processing:** {uploaded_file.name}")
-            st.markdown(f"   Pixel size (mm): {pixel_size}")
-            st.markdown(f"   Gestational age (wks): {ga_weeks:.2f}")
-            st.markdown("🔍 Running HC segmentation and measurements...")
+        # --- HC analysis ---
+        img_resized_hc, mask_color_hc, overlay_hc, pred_mask_hc, hc_mm = apply_unet_for_hc(img_bgr, pixel_size)
 
-            # --- HC measurement ---
-            img_resized_hc, mask_color_hc, overlay_hc, pred_mask_hc, hc_mm, unique_classes = apply_unet_for_hc(img_bgr, pixel_size)
-            ig = hc_to_z_percentile(hc_mm, ga_weeks) if hc_mm>0 else None
+        col1, col2, col3 = st.columns(3)
+        col1.image(cv2.cvtColor(img_resized_hc, cv2.COLOR_BGR2RGB), caption="Original Image", use_column_width=True)
+        col2.image(cv2.cvtColor(mask_color_hc, cv2.COLOR_BGR2RGB), caption="Segmentation Mask", use_column_width=True)
+        col3.image(cv2.cvtColor(overlay_hc, cv2.COLOR_BGR2RGB), caption="Overlay with Contours", use_column_width=True)
 
-            hc_col.subheader("✅ HC MEASUREMENT RESULTS")
-            hc_col.markdown("============================================================")
-            if hc_mm>0:
-                hc_col.markdown(f"Head Circumference: **{hc_mm:.1f} mm**")
-            if ig:
-                hc_col.markdown(f"Intergrowth median @ {ga_weeks:.2f} wks: **{ig['median']:.1f} mm**")
-                hc_col.markdown(f"z-score: **{ig['z']:.2f}**")
-                hc_col.markdown(f"percentile: **{ig['pct']:.1f}th**")
-                if ig['z']>2: hc_col.markdown("⚠ Macrocephaly (>= +2 SD) → DIAGNOSTIC: ANORMAL")
-                if ig['z']<-2: hc_col.markdown("⚠ Microcephaly (<= -2 SD) → DIAGNOSTIC: ANORMAL")
-            hc_col.markdown("📊 RÉSULTATS DE MESURE")
-            hc_col.markdown(f"Âge gestationnel:\t{ga_weeks:.1f} semaines")
-            hc_col.markdown(f"Diamètre ventriculaire (LV): {0.0:.1f} mm")
-            hc_col.markdown(f"Diamètre CSP: {0.0:.1f} mm")
-            hc_col.markdown("🔍 DÉTAILS DU DIAGNOSTIC")
+        ig = hc_to_z_percentile(hc_mm, ga_weeks) if hc_mm>0 else None
 
-            # --- CSP & LV analysis ---
-            original_csp, mask_img_csp, overlay_csp, lv_pixels, csp_pixels = apply_unet_for_csp_ventricles(img_bgr)
-            diagnostics, status, status_color, lv_diameter_mm, csp_diameter_mm = analyse_anomalies(
-                csp_pixels, lv_pixels, ga_weeks, pixel_size
-            )
+        st.markdown("============================================================")
+        st.subheader("✅ HC Measurement Results")
+        if hc_mm>0:
+            st.markdown(f"Head Circumference: **{hc_mm:.1f} mm**")
+        if ig:
+            st.markdown(f"Intergrowth median @ {ga_weeks:.2f} wks: **{ig['median']:.1f} mm**")
+            st.markdown(f"z-score: **{ig['z']:.2f}**")
+            st.markdown(f"percentile: **{ig['pct']:.1f}th**")
+            if ig['z']>2: st.markdown("⚠ Macrocephaly → DIAGNOSTIC: ANORMAL")
+            if ig['z']<-2: st.markdown("⚠ Microcephaly → DIAGNOSTIC: ANORMAL")
 
-            csp_col.subheader("✅ CSP & VENTRICULAR ANALYSIS RESULTS")
-            csp_col.markdown("============================================================")
-            csp_col.markdown(f"STATUS: **{status}**")
-            csp_col.markdown(f"Ventricular diameter (LV): {lv_diameter_mm:.1f} mm")
-            csp_col.markdown(f"CSP diameter: {csp_diameter_mm:.1f} mm")
-            csp_col.markdown(f"Gestational age: {ga_weeks:.1f} weeks")
-            csp_col.markdown("\nDETAILS:\n----------------------------------------")
-            for diag in diagnostics:
-                # Tooltip example
-                csp_col.markdown(f"<span title='Threshold info'>{diag}</span>", unsafe_allow_html=True)
-            csp_col.markdown("============================================================")
+        # --- CSP/LV analysis ---
+        original_csp, mask_csp, overlay_csp, lv_pixels, csp_pixels = apply_unet_for_csp_ventricles(img_bgr)
+        diagnostics, status, status_color, lv_diameter_mm, csp_diameter_mm = analyse_anomalies(csp_pixels, lv_pixels, ga_weeks, pixel_size)
 
-        except Exception as e:
-            st.error("❌ Error during processing:")
-            st.text(traceback.format_exc())
+        st.markdown("============================================================")
+        st.subheader("✅ CSP & Ventricular Analysis Results")
+        st.markdown(f"Status: **{status}**")
+        st.markdown(f"Ventricular diameter (LV): {lv_diameter_mm:.1f} mm")
+        st.markdown(f"CSP diameter: {csp_diameter_mm:.1f} mm")
+        st.markdown(f"Gestational age: {ga_weeks:.1f} weeks")
+        st.markdown("DETAILS:")
+        for diag in diagnostics:
+            st.markdown(f"<span title='Threshold info'>{diag}</span>", unsafe_allow_html=True)
+
+        st.image([cv2.cvtColor(original_csp, cv2.COLOR_BGR2RGB),
+                  cv2.cvtColor(mask_csp, cv2.COLOR_BGR2RGB),
+                  cv2.cvtColor(overlay_csp, cv2.COLOR_BGR2RGB)],
+                 caption=["Original CSP/LV","Mask CSP/LV","Overlay CSP/LV"], use_column_width=True)
+
+    except Exception as e:
+        st.error("❌ Error during processing:")
+        st.text(traceback.format_exc())
