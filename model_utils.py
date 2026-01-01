@@ -2,11 +2,13 @@ import numpy as np
 import cv2
 import tensorflow as tf
 
+IMG_SIZE = 256
+
 # ================================
 # Load trained UNet model
 # ================================
-def load_model(fetal_unet_model.h5):
-    model = tf.keras.models.load_model(fetal_unet_model.h5, compile=False)
+def load_model(model_path):
+    model = tf.keras.models.load_model(model_path, compile=False)
     return model
 
 
@@ -14,9 +16,10 @@ def load_model(fetal_unet_model.h5):
 # Preprocess image
 # ================================
 def preprocess_image(image):
-    image = cv2.resize(image, (256, 256))
+    image = cv2.resize(image, (IMG_SIZE, IMG_SIZE))
     image = image / 255.0
-    return np.expand_dims(image, axis=0)
+    image = np.expand_dims(image, axis=0)
+    return image
 
 
 # ================================
@@ -38,10 +41,10 @@ def clean_mask(mask):
 
 
 # ================================
-# Dummy medical analysis (à enrichir)
+# Simple LV analysis
 # ================================
 def analyze_lv(mask):
-    lv_pixels = np.sum(mask == 2)  # exemple : classe 2 = ventricule
+    lv_pixels = np.sum(mask == 3)  # classe 3 = ventricule latéral
     if lv_pixels < 500:
         return "LV normal"
     else:
