@@ -1,5 +1,5 @@
 # ============================================
-# Fetal Brain Analysis Streamlit App - Dashboard UI
+# Fetal Brain Analysis Streamlit App - Interactive UI
 # ============================================
 
 import streamlit as st
@@ -165,7 +165,7 @@ def analyse_anomalies(csp_pixels, lv_pixels, week, pixel_to_mm):
 # -----------------------------
 
 st.set_page_config(page_title="Fetal Brain Analysis", layout="wide")
-st.markdown("<h1 style='text-align:center; color:#4a6fa5;'>🧠 Fetal Brain Analysis Dashboard</h1>", unsafe_allow_html=True)
+st.markdown("<h1 style='text-align:center; color:#4a6fa5;'>🧠 Fetal Brain Analysis System</h1>", unsafe_allow_html=True)
 st.markdown("<p style='text-align:center;'>UNet Segmentation • HC Measurement • CSP/Ventricular Analysis</p>", unsafe_allow_html=True)
 
 st.sidebar.header("Upload & Parameters")
@@ -185,43 +185,38 @@ if process_btn and uploaded_file is not None:
         st.markdown(f"   Gestational age (wks): {ga_weeks:.2f}")
         st.markdown("🔍 Running HC segmentation and measurements...")
 
-        # Tabs layout
-        tab1, tab2 = st.tabs(["HC Analysis", "CSP & LV Analysis"])
+        # --- HC analysis ---
+        img_resized_hc, mask_color_hc, overlay_hc, pred_mask_hc, hc_mm = apply_unet_for_hc(img_bgr, pixel_size)
+        ig = hc_to_z_percentile(hc_mm, ga_weeks) if hc_mm>0 else None
 
-        # --- HC tab ---
-        with tab1:
-            img_resized_hc, mask_color_hc, overlay_hc, pred_mask_hc, hc_mm = apply_unet_for_hc(img_bgr, pixel_size)
-            ig = hc_to_z_percentile(hc_mm, ga_weeks) if hc_mm>0 else None
+        st.markdown("### Head Circumference (HC) Analysis")
+        hc_col1, hc_col2, hc_col3 = st.columns(3)
+        hc_col1.image(cv2.cvtColor(img_resized_hc, cv2.COLOR_BGR2RGB), caption="Original Image", use_column_width=True)
+        hc_col2.image(cv2.cvtColor(mask_color_hc, cv2.COLOR_BGR2RGB), caption="Segmentation Mask", use_column_width=True)
+        hc_col3.image(cv2.cvtColor(overlay_hc, cv2.COLOR_BGR2RGB), caption="Overlay + Contours", use_column_width=True)
 
-            st.markdown("### Head Circumference (HC) Analysis")
-            hc_col1, hc_col2, hc_col3 = st.columns(3)
-            hc_col1.image(cv2.cvtColor(img_resized_hc, cv2.COLOR_BGR2RGB), caption="Original Image")
-            hc_col2.image(cv2.cvtColor(mask_color_hc, cv2.COLOR_BGR2RGB), caption="Segmentation Mask")
-            hc_col3.image(cv2.cvtColor(overlay_hc, cv2.COLOR_BGR2RGB), caption="Overlay + Contours")
+        st.markdown(f"**HC (mm):** {hc_mm:.1f}")
+        if ig:
+            st.progress(min(max(ig['pct']/100.0,0),1.0))
+            st.markdown(f"Percentile: {ig['pct']:.1f}th | z-score: {ig['z']:.2f}")
+            if ig['z']>2: st.markdown("⚠ Macrocephaly → DIAGNOSTIC: ANORMAL", unsafe_allow_html=True)
+            if ig['z']<-2: st.markdown("⚠ Microcephaly → DIAGNOSTIC: ANORMAL", unsafe_allow_html=True)
 
-            st.markdown(f"**HC (mm):** {hc_mm:.1f}")
-            if ig:
-                st.progress(min(max(ig['pct']/100.0,0),1.0))
-                st.markdown(f"Percentile: {ig['pct']:.1f}th | z-score: {ig['z']:.2f}")
-                if ig['z']>2: st.markdown("⚠ Macrocephaly → DIAGNOSTIC: ANORMAL", unsafe_allow_html=True)
-                if ig['z']<-2: st.markdown("⚠ Microcephaly → DIAGNOSTIC: ANORMAL", unsafe_allow_html=True)
+        # --- CSP/LV analysis ---
+        original_csp, mask_csp, overlay_csp, lv_pixels, csp_pixels = apply_unet_for_csp_ventricles(img_bgr)
+        diagnostics, status, status_color, lv_diameter_mm, csp_diameter_mm = analyse_anomalies(csp_pixels, lv_pixels, ga_weeks, pixel_size)
 
-        # --- CSP/LV tab ---
-        with tab2:
-            original_csp, mask_csp, overlay_csp, lv_pixels, csp_pixels = apply_unet_for_csp_ventricles(img_bgr)
-            diagnostics, status, status_color, lv_diameter_mm, csp_diameter_mm = analyse_anomalies(csp_pixels, lv_pixels, ga_weeks, pixel_size)
+        st.markdown("### CSP & Lateral Ventricles (LV) Analysis")
+        csp_col1, csp_col2, csp_col3 = st.columns(3)
+        csp_col1.image(cv2.cvtColor(original_csp, cv2.COLOR_BGR2RGB), caption="Original CSP/LV", use_column_width=True)
+        csp_col2.image(cv2.cvtColor(mask_csp, cv2.COLOR_BGR2RGB), caption="Mask CSP/LV", use_column_width=True)
+        csp_col3.image(cv2.cvtColor(overlay_csp, cv2.COLOR_BGR2RGB), caption="Overlay CSP/LV", use_column_width=True)
 
-            st.markdown("### CSP & Lateral Ventricles (LV) Analysis")
-            csp_col1, csp_col2, csp_col3 = st.columns(3)
-            csp_col1.image(cv2.cvtColor(original_csp, cv2.COLOR_BGR2RGB), caption="Original CSP/LV")
-            csp_col2.image(cv2.cvtColor(mask_csp, cv2.COLOR_BGR2RGB), caption="Mask CSP/LV")
-            csp_col3.image(cv2.cvtColor(overlay_csp, cv2.COLOR_BGR2RGB), caption="Overlay CSP/LV")
-
-            st.markdown(f"**Status:** <span style='color:{status_color}'>{status}</span>", unsafe_allow_html=True)
-            st.markdown(f"LV Diameter: {lv_diameter_mm:.1f} mm | CSP Diameter: {csp_diameter_mm:.1f} mm")
-            st.markdown("#### Diagnostic Details (hover to see thresholds):")
-            for diag in diagnostics:
-                st.markdown(f"<span title='Threshold info'>{diag}</span>", unsafe_allow_html=True)
+        st.markdown(f"**Status:** <span style='color:{status_color}'>{status}</span>", unsafe_allow_html=True)
+        st.markdown(f"LV Diameter: {lv_diameter_mm:.1f} mm | CSP Diameter: {csp_diameter_mm:.1f} mm")
+        st.markdown("#### Diagnostic Details:")
+        for diag in diagnostics:
+            st.markdown(f"<span title='Threshold info'>{diag}</span>", unsafe_allow_html=True)
 
     except Exception as e:
         st.error("❌ Error during processing:")
