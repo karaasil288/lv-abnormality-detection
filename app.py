@@ -15,7 +15,7 @@ from PIL import Image, ImageDraw
 # PART 0: Load UNet model
 # ================================
 
-UNET_PATH = "fetal_unet_model.h5"  # adjust if needed
+UNET_PATH = "fetal_unet_model.h5"  # put your model in the same folder or adjust path
 if not os.path.exists(UNET_PATH):
     st.error(f"Model not found at {UNET_PATH}. Upload your fetal_unet_model.h5 to this path or change UNET_PATH.")
     st.stop()
@@ -30,7 +30,7 @@ st.success(f"✅ UNet model loaded from: {UNET_PATH}")
 IMG_SIZE = 256
 COLORS = {1: (0, 0, 255), 2: (0, 255, 255), 3: (255, 0, 0)}
 
-# Intergrowth HC table (shortened for brevity, add full table)
+# Intergrowth HC table
 INTERGROWTH_HC = {
     14: (87.38, 88.69, 90.73, 97.88, 105.02, 107.06, 108.37),
     15: (99.22,100.61,102.78,110.37,117.97,120.13,121.53),
@@ -65,82 +65,114 @@ def interp_intergrowth(ga_weeks):
     if ga_weeks < 14.0: ga_weeks = 14.0
     if ga_weeks > 40.0: ga_weeks = 40.0
     low, high = int(math.floor(ga_weeks)), int(math.ceil(ga_weeks))
-    if low==high:
+    if low == high:
         vals = INTERGROWTH_HC[low]
-    else:
-        frac = ga_weeks - low
-        lo, hi = INTERGROWTH_HC[low], INTERGROWTH_HC[high]
-        vals = [lo[i]+(hi[i]-lo[i])*frac for i in range(len(lo))]
-    return {'p3':vals[0],'p5':vals[1],'p10':vals[2],'p50':vals[3],'p90':vals[4],'p95':vals[5],'p97':vals[6]}
+        return {'p3':vals[0],'p5':vals[1],'p10':vals[2],'p50':vals[3],'p90':vals[4],'p95':vals[5],'p97':vals[6]}
+    frac = ga_weeks - low
+    lo, hi = INTERGROWTH_HC[low], INTERGROWTH_HC[high]
+    interp = [ lo[i] + (hi[i]-lo[i])*frac for i in range(len(lo)) ]
+    return {'p3':interp[0],'p5':interp[1],'p10':interp[2],'p50':interp[3],'p90':interp[4],'p95':interp[5],'p97':interp[6]}
 
-def estimate_sd_from_centiles(p3, p97): return (p97-p3)/3.761578
-def normal_cdf(z): return 0.5*(1.0+math.erf(z/math.sqrt(2.0)))
+def estimate_sd_from_centiles(p3, p97):
+    return (p97 - p3) / 3.761578
+
+def normal_cdf(z):
+    return 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
 
 def hc_to_z_percentile(hc_mm, ga_weeks):
     cent = interp_intergrowth(ga_weeks)
-    sd = estimate_sd_from_centiles(cent['p3'], cent['p97'])
-    z = (hc_mm-cent['p50'])/sd if sd>0 else 0
-    pct = normal_cdf(z)*100
-    return {'z':z,'pct':pct,'median':cent['p50'],'sd':sd,'centiles':cent}
+    p3, p50, p97 = cent['p3'], cent['p50'], cent['p97']
+    sd = estimate_sd_from_centiles(p3, p97)
+    if sd <= 0: return None
+    z = (hc_mm - p50) / sd
+    pct = normal_cdf(z) * 100.0
+    return {'z': z, 'pct': pct, 'median': p50, 'sd': sd, 'centiles': cent}
 
 # ================================
-# PART 2: UNet Helpers
+# PART 2: HC & CSP/LV Helpers
 # ================================
 
-IMG_SIZE = 256
+def calculate_hc_from_segmentation(mask, pixel_size_mm, original_height=None):
+    brain_mask = (mask == 1).astype(np.uint8)
+    if np.sum(brain_mask) == 0: return 0.0, None, None
+    kernel = np.ones((3,3), np.uint8)
+    brain_mask = cv2.morphologyEx(brain_mask, cv2.MORPH_CLOSE, kernel)
+    brain_mask = cv2.morphologyEx(brain_mask, cv2.MORPH_OPEN, kernel)
+    contours, _ = cv2.findContours(brain_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if len(contours) == 0: return 0.0, None, None
+    largest_contour = max(contours, key=cv2.contourArea)
+    ellipse = None
+    if len(largest_contour) >= 5:
+        ellipse = cv2.fitEllipse(largest_contour)
+        (center, axes, orientation) = ellipse
+        major_axis, minor_axis = max(axes)/2.0, min(axes)/2.0
+        h = ((major_axis - minor_axis) * 2) / ((major_axis + minor_axis) * 2 + 1e-10)
+        circumference_pixels = math.pi * (major_axis + minor_axis) * (1 + (3*h)/(10 + math.sqrt(4-3*h)))
+        perimeter_pixels = cv2.arcLength(largest_contour, True)
+        hc_pixels = (circumference_pixels + perimeter_pixels)/2.0
+    else:
+        hc_pixels = cv2.arcLength(largest_contour, True)
+    if original_height and original_height != IMG_SIZE:
+        hc_pixels *= original_height / IMG_SIZE
+    hc_mm = hc_pixels * pixel_size_mm
+    return hc_mm, largest_contour, ellipse
 
 def apply_unet_for_hc(image_bgr, pixel_size_mm):
     original_h, original_w = image_bgr.shape[:2]
     image_resized = cv2.resize(image_bgr, (IMG_SIZE, IMG_SIZE))
     image_norm = image_resized.astype(np.float32)/255.0
     pred = unet_model.predict(np.expand_dims(image_norm,0), verbose=0)[0]
-    if pred.ndim==3 and pred.shape[2]>1:
+    if pred.ndim == 3 and pred.shape[2] > 1:
         pred_mask = np.argmax(pred, axis=-1).astype(np.uint8)
     else:
         pr = pred[:,:,0] if pred.ndim==3 else pred
         pred_mask = (pr>0.5).astype(np.uint8)
-    mask_color = np.zeros((IMG_SIZE,IMG_SIZE,3), np.uint8)
-    for cls, col in COLORS.items(): mask_color[pred_mask==cls]=col
-    brain_mask = (pred_mask==1).astype(np.uint8)
-    contours,_ = cv2.findContours(brain_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    hc_mm=0
-    if contours:
-        cnt = max(contours,key=cv2.contourArea)
-        hc_pixels = cv2.arcLength(cnt, True)
-        hc_mm = hc_pixels*pixel_size_mm
-    overlay = cv2.addWeighted(image_resized,0.6,mask_color,0.4,0)
     unique_classes = np.unique(pred_mask)
+    mask_color = np.zeros((IMG_SIZE,IMG_SIZE,3), dtype=np.uint8)
+    for cls, col in COLORS.items(): mask_color[pred_mask==cls] = col
+    hc_mm, contour, ellipse = calculate_hc_from_segmentation(pred_mask, pixel_size_mm, original_h)
+    overlay = cv2.addWeighted(image_resized,0.6,mask_color,0.4,0)
+    if contour is not None: cv2.drawContours(overlay,[contour],-1,(0,255,0),2)
+    if ellipse is not None: cv2.ellipse(overlay, ellipse,(0,255,255),2)
     return image_resized, mask_color, overlay, pred_mask, hc_mm, unique_classes
 
 def apply_unet_for_csp_ventricles(image_array):
     image_resized = cv2.resize(image_array, (IMG_SIZE, IMG_SIZE))
-    image_norm = image_resized.astype(np.float32)/255.0
-    pred_mask = unet_model.predict(np.expand_dims(image_norm,0), verbose=0)[0]
+    image_norm = image_resized.astype(np.float32) / 255.0
+    image_input = np.expand_dims(image_norm, 0)
+    pred_mask = unet_model.predict(image_input, verbose=0)[0]
     pred_mask = np.argmax(pred_mask, axis=-1).astype(np.uint8)
-    mask_color = np.zeros((IMG_SIZE,IMG_SIZE,3), np.uint8)
-    for cls,col in COLORS.items(): mask_color[pred_mask==cls]=col
-    overlay = cv2.addWeighted(image_resized,0.6,mask_color,0.4,0)
-    lv_pixels = np.sum(pred_mask==3)
-    csp_pixels = np.sum(pred_mask==2)
+    mask_color = np.zeros((IMG_SIZE, IMG_SIZE, 3), np.uint8)
+    for cls, col in COLORS.items(): mask_color[pred_mask == cls] = col
+    overlay = cv2.addWeighted(image_resized, 0.6, mask_color, 0.4, 0)
+    lv_pixels = np.sum(pred_mask == 3)
+    csp_pixels = np.sum(pred_mask == 2)
     return image_resized, mask_color, overlay, lv_pixels, csp_pixels
 
 def analyse_anomalies(csp_pixels, lv_pixels, week, pixel_to_mm):
     pixel_size_mm = pixel_to_mm
-    lv_area_mm2 = lv_pixels * (pixel_size_mm**2)
-    lv_diameter_mm = 2*np.sqrt(lv_area_mm2/np.pi) if lv_pixels>0 else 0
-    csp_area_mm2 = csp_pixels * (pixel_size_mm**2)
-    csp_diameter_mm = 2*np.sqrt(csp_area_mm2/np.pi) if csp_pixels>0 else 0
-    diagnostics=[]
-    status="NORMAL"
-    status_color="green"
-    if csp_pixels==0: 
-        status="ANORMAL"
-        status_color="red"
-        diagnostics.append(f"⚠️ CSP NON VISIBLE ({week}-{37} sem) → SUSPICION DE MALFORMATION")
-        diagnostics.append("• Agénésie du corps calleux (ACC)")
-        diagnostics.append("• Holoprosencéphalie (HPE)")
-        diagnostics.append("• Dysplasie septo-optique (SOD)")
-    if lv_pixels==0: diagnostics.append("ℹ️ Ventricules latéraux non détectés")
+    lv_area_mm2 = lv_pixels * (pixel_size_mm ** 2)
+    lv_diameter_mm = 2 * np.sqrt(lv_area_mm2 / np.pi) if lv_pixels > 0 else 0
+    csp_area_mm2 = csp_pixels * (pixel_size_mm ** 2)
+    csp_diameter_mm = 2 * np.sqrt(csp_area_mm2 / np.pi) if csp_pixels > 0 else 0
+    diagnostics = []
+    status = "NORMAL"
+    status_color = "green"
+
+    # --- CSP anomalies ---
+    if week < 20:
+        if csp_diameter_mm > 4: diagnostics.append(f"CSP diameter {csp_diameter_mm:.1f} mm is larger than expected for <20 weeks")
+    else:
+        if csp_diameter_mm < 2 or csp_diameter_mm > 10:
+            diagnostics.append(f"CSP diameter {csp_diameter_mm:.1f} mm is outside normal range (2-10 mm)")
+
+    # --- LV anomalies ---
+    if lv_diameter_mm > 10: diagnostics.append(f"LV diameter {lv_diameter_mm:.1f} mm suggests possible ventriculomegaly")
+
+    if diagnostics: 
+        status = "ABNORMAL"
+        status_color = "red"
+
     return diagnostics, status, status_color, lv_diameter_mm, csp_diameter_mm
 
 # ================================
@@ -151,13 +183,15 @@ st.set_page_config(page_title="Fetal Brain Analysis", layout="wide")
 st.markdown("<h1 style='text-align:center; color:#4a6fa5;'>🧠 Fetal Brain Analysis System</h1>", unsafe_allow_html=True)
 st.markdown("<p style='text-align:center;'>UNet Segmentation • HC Measurement • CSP/Ventricular Analysis</p>", unsafe_allow_html=True)
 
+# Sidebar inputs
 st.sidebar.header("Upload & Parameters")
 uploaded_file = st.sidebar.file_uploader("Upload Ultrasound Image", type=['jpg','jpeg','png','bmp','tif'])
 pixel_size = st.sidebar.number_input("Pixel size (mm)", value=0.219544094, step=0.0001)
 ga_weeks = st.sidebar.number_input("Gestational age (weeks)", value=28.0, step=0.1)
 process_btn = st.sidebar.button("Process & Analyze")
 
-hc_col, csp_col = st.columns([2,3])
+# Main columns for outputs
+hc_col, csp_col = st.columns([2, 3])
 
 if process_btn:
     if uploaded_file is None:
@@ -168,30 +202,53 @@ if process_btn:
             img_rgb = np.array(pil)
             img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
 
-            # HC measurement
+            # --- HC measurement ---
             img_resized_hc, mask_color_hc, overlay_hc, pred_mask_hc, hc_mm, unique_classes = apply_unet_for_hc(img_bgr, pixel_size)
             ig = hc_to_z_percentile(hc_mm, ga_weeks) if hc_mm>0 else None
 
-            # CSP/LV analysis
+            # Compose HC visualization grid
+            def make_info_tile_hc():
+                info_tile = np.zeros((320, 320, 3), dtype=np.uint8)
+                info_tile[:] = (30, 30, 30)
+                info_pil = Image.fromarray(info_tile)
+                draw = ImageDraw.Draw(info_pil)
+                draw.text((10, 10), "HC Measurement Results", fill=(255,255,255))
+                draw.text((10, 40), f"HC (mm): {hc_mm:.1f}" if hc_mm>0 else "HC (mm): N/A", fill=(200,200,200))
+                if ig:
+                    draw.text((10,70), f"Intergrowth median: {ig['median']:.1f} mm", fill=(200,200,200))
+                    draw.text((10,100), f"z-score: {ig['z']:.2f}", fill=(0,255,0) if -2<ig['z']<2 else (255,165,0))
+                    draw.text((10,130), f"percentile: {ig['pct']:.1f}th", fill=(255,255,0))
+                return np.array(info_pil)
+
+            orig_tile = cv2.resize(cv2.cvtColor(img_resized_hc, cv2.COLOR_BGR2RGB),(320,320))
+            seg_tile = cv2.resize(cv2.cvtColor(mask_color_hc, cv2.COLOR_BGR2RGB),(320,320))
+            ov_tile = cv2.resize(cv2.cvtColor(overlay_hc, cv2.COLOR_BGR2RGB),(320,320))
+            info_tile = make_info_tile_hc()
+            top_row_hc = np.hstack([orig_tile, seg_tile])
+            bottom_row_hc = np.hstack([ov_tile, info_tile])
+            final_hc = np.vstack([top_row_hc, bottom_row_hc])
+            hc_col.image(final_hc, caption="HC Measurement", use_column_width=True)
+
+            # --- CSP & LV analysis ---
             original_csp, mask_img_csp, overlay_csp, lv_pixels, csp_pixels = apply_unet_for_csp_ventricles(img_bgr)
-            diagnostics, status, status_color, lv_diameter_mm, csp_diameter_mm = analyse_anomalies(csp_pixels, lv_pixels, ga_weeks, pixel_size)
+            diagnostics, status, status_color, lv_diameter_mm, csp_diameter_mm = analyse_anomalies(
+                csp_pixels, lv_pixels, ga_weeks, pixel_size
+            )
 
-            # HC Box
-            hc_html=f"""
-            <div style="border:2px solid #4a6fa5; padding:10px; border-radius:10px; background-color:#f0f8ff;">
-            <h3>✅ HC MEASUREMENT RESULTS</h3>
-            <p>Head Circumference: {hc_mm:.1f} mm</p>
-            <p>Intergrowth median @ {ga_weeks:.2f} wks: {ig['median']:.1f} mm</p>
-            <p>z-score: {ig['z']:.2f}</p>
-            <p>percentile: {ig['pct']:.1f}th</p>
-            <p>{"⚠ Macrocephaly (>= +2 SD)" if ig['z']>2 else ""}</p>
-            <p>Segmentation classes seen: {list(unique_classes)}</p>
-            </div>
-            """
-            st.markdown(hc_html, unsafe_allow_html=True)
+            # Compose CSP visualization
+            o_csp = cv2.cvtColor(original_csp, cv2.COLOR_BGR2RGB)
+            m_csp = cv2.cvtColor(mask_img_csp, cv2.COLOR_BGR2RGB)
+            ov_csp = cv2.cvtColor(overlay_csp, cv2.COLOR_BGR2RGB)
+            o_csp = cv2.resize(o_csp, (300, 300))
+            m_csp = cv2.resize(m_csp, (300, 300))
+            ov_csp = cv2.resize(ov_csp, (300, 300))
+            top_csp = np.hstack([o_csp, m_csp])
+            bot_csp = np.hstack([ov_csp, np.zeros((300,300,3), np.uint8)])
+            final_csp = np.vstack([top_csp, bot_csp])
+            csp_col.image(final_csp, caption="CSP & LV Analysis", use_column_width=True)
 
-            # CSP/LV Box
-            diag_html=f"""
+            # Display HTML diagnostic
+            diag_html = f"""
             <div style="border:2px solid {status_color}; padding:15px; border-radius:10px; background-color:#f8f9fa;">
             <h3 style="color:{status_color};">DIAGNOSTIC: {status}</h3>
             <p>Gestational age: {ga_weeks} weeks</p>
@@ -199,13 +256,10 @@ if process_btn:
             <p>CSP diameter: {csp_diameter_mm:.1f} mm</p>
             <ul>
             """
-            for msg in diagnostics: diag_html+=f"<li>{msg}</li>"
-            diag_html+="</ul></div>"
+            for msg in diagnostics:
+                diag_html += f"<li>{msg}</li>"
+            diag_html += "</ul></div>"
             st.markdown(diag_html, unsafe_allow_html=True)
-
-            # Display overlays
-            hc_col.image(cv2.cvtColor(overlay_hc, cv2.COLOR_BGR2RGB), caption="HC Segmentation Overlay", use_column_width=True)
-            csp_col.image(cv2.cvtColor(overlay_csp, cv2.COLOR_BGR2RGB), caption="CSP & LV Overlay", use_column_width=True)
 
         except Exception as e:
             st.error("❌ Error during processing:")
