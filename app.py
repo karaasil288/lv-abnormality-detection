@@ -156,111 +156,23 @@ def analyse_anomalies(csp_pixels, lv_pixels, week, pixel_to_mm):
     csp_area_mm2 = csp_pixels * (pixel_size_mm ** 2)
     csp_diameter_mm = 2 * np.sqrt(csp_area_mm2 / np.pi) if csp_pixels > 0 else 0
     diagnostics = []
+
+    # CSP analysis
+    if week < 20:
+        if csp_diameter_mm > 4: diagnostics.append(("CSP diameter abnormal for <20w", "red"))
+        else: diagnostics.append(("CSP diameter normal", "green"))
+    else:
+        if csp_diameter_mm < 2 or csp_diameter_mm > 10: diagnostics.append(("CSP diameter outside normal range (2-10 mm)", "red"))
+        else: diagnostics.append(("CSP diameter normal", "green"))
+
+    # LV analysis
+    if lv_diameter_mm > 10: diagnostics.append(("LV diameter suggests possible ventriculomegaly", "red"))
+    else: diagnostics.append(("LV diameter normal", "green"))
+
     status = "NORMAL"
     status_color = "green"
-
-    # --- CSP anomalies ---
-    if week < 20:
-        if csp_diameter_mm > 4: diagnostics.append(f"CSP diameter {csp_diameter_mm:.1f} mm is larger than expected for <20 weeks")
-    else:
-        if csp_diameter_mm < 2 or csp_diameter_mm > 10:
-            diagnostics.append(f"CSP diameter {csp_diameter_mm:.1f} mm is outside normal range (2-10 mm)")
-
-    # --- LV anomalies ---
-    if lv_diameter_mm > 10: diagnostics.append(f"LV diameter {lv_diameter_mm:.1f} mm suggests possible ventriculomegaly")
-
-    if diagnostics: 
+    if any(color=="red" for _,color in diagnostics): 
         status = "ABNORMAL"
         status_color = "red"
 
     return diagnostics, status, status_color, lv_diameter_mm, csp_diameter_mm
-
-# ================================
-# PART 3: Streamlit UI
-# ================================
-
-st.set_page_config(page_title="Fetal Brain Analysis", layout="wide")
-st.markdown("<h1 style='text-align:center; color:#4a6fa5;'>🧠 Fetal Brain Analysis System</h1>", unsafe_allow_html=True)
-st.markdown("<p style='text-align:center;'>UNet Segmentation • HC Measurement • CSP/Ventricular Analysis</p>", unsafe_allow_html=True)
-
-# Sidebar inputs
-st.sidebar.header("Upload & Parameters")
-uploaded_file = st.sidebar.file_uploader("Upload Ultrasound Image", type=['jpg','jpeg','png','bmp','tif'])
-pixel_size = st.sidebar.number_input("Pixel size (mm)", value=0.219544094, step=0.0001)
-ga_weeks = st.sidebar.number_input("Gestational age (weeks)", value=28.0, step=0.1)
-process_btn = st.sidebar.button("Process & Analyze")
-
-# Main columns for outputs
-hc_col, csp_col = st.columns([2, 3])
-
-if process_btn:
-    if uploaded_file is None:
-        st.sidebar.error("❌ Please upload an image first!")
-    else:
-        try:
-            pil = Image.open(uploaded_file).convert("RGB")
-            img_rgb = np.array(pil)
-            img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
-
-            # --- HC measurement ---
-            img_resized_hc, mask_color_hc, overlay_hc, pred_mask_hc, hc_mm, unique_classes = apply_unet_for_hc(img_bgr, pixel_size)
-            ig = hc_to_z_percentile(hc_mm, ga_weeks) if hc_mm>0 else None
-
-            # Compose HC visualization grid
-            def make_info_tile_hc():
-                info_tile = np.zeros((320, 320, 3), dtype=np.uint8)
-                info_tile[:] = (30, 30, 30)
-                info_pil = Image.fromarray(info_tile)
-                draw = ImageDraw.Draw(info_pil)
-                draw.text((10, 10), "HC Measurement Results", fill=(255,255,255))
-                draw.text((10, 40), f"HC (mm): {hc_mm:.1f}" if hc_mm>0 else "HC (mm): N/A", fill=(200,200,200))
-                if ig:
-                    draw.text((10,70), f"Intergrowth median: {ig['median']:.1f} mm", fill=(200,200,200))
-                    draw.text((10,100), f"z-score: {ig['z']:.2f}", fill=(0,255,0) if -2<ig['z']<2 else (255,165,0))
-                    draw.text((10,130), f"percentile: {ig['pct']:.1f}th", fill=(255,255,0))
-                return np.array(info_pil)
-
-            orig_tile = cv2.resize(cv2.cvtColor(img_resized_hc, cv2.COLOR_BGR2RGB),(320,320))
-            seg_tile = cv2.resize(cv2.cvtColor(mask_color_hc, cv2.COLOR_BGR2RGB),(320,320))
-            ov_tile = cv2.resize(cv2.cvtColor(overlay_hc, cv2.COLOR_BGR2RGB),(320,320))
-            info_tile = make_info_tile_hc()
-            top_row_hc = np.hstack([orig_tile, seg_tile])
-            bottom_row_hc = np.hstack([ov_tile, info_tile])
-            final_hc = np.vstack([top_row_hc, bottom_row_hc])
-            hc_col.image(final_hc, caption="HC Measurement", use_column_width=True)
-
-            # --- CSP & LV analysis ---
-            original_csp, mask_img_csp, overlay_csp, lv_pixels, csp_pixels = apply_unet_for_csp_ventricles(img_bgr)
-            diagnostics, status, status_color, lv_diameter_mm, csp_diameter_mm = analyse_anomalies(
-                csp_pixels, lv_pixels, ga_weeks, pixel_size
-            )
-
-            # Compose CSP visualization
-            o_csp = cv2.cvtColor(original_csp, cv2.COLOR_BGR2RGB)
-            m_csp = cv2.cvtColor(mask_img_csp, cv2.COLOR_BGR2RGB)
-            ov_csp = cv2.cvtColor(overlay_csp, cv2.COLOR_BGR2RGB)
-            o_csp = cv2.resize(o_csp, (300, 300))
-            m_csp = cv2.resize(m_csp, (300, 300))
-            ov_csp = cv2.resize(ov_csp, (300, 300))
-            top_csp = np.hstack([o_csp, m_csp])
-            bot_csp = np.hstack([ov_csp, np.zeros((300,300,3), np.uint8)])
-            final_csp = np.vstack([top_csp, bot_csp])
-            csp_col.image(final_csp, caption="CSP & LV Analysis", use_column_width=True)
-
-            # Display HTML diagnostic
-            diag_html = f"""
-            <div style="border:2px solid {status_color}; padding:15px; border-radius:10px; background-color:#f8f9fa;">
-            <h3 style="color:{status_color};">DIAGNOSTIC: {status}</h3>
-            <p>Gestational age: {ga_weeks} weeks</p>
-            <p>LV diameter: {lv_diameter_mm:.1f} mm</p>
-            <p>CSP diameter: {csp_diameter_mm:.1f} mm</p>
-            <ul>
-            """
-            for msg in diagnostics:
-                diag_html += f"<li>{msg}</li>"
-            diag_html += "</ul></div>"
-            st.markdown(diag_html, unsafe_allow_html=True)
-
-        except Exception as e:
-            st.error("❌ Error during processing:")
-            st.text(traceback.format_exc())
