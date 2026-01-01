@@ -60,4 +60,3 @@ def analyze_lv(mask):
         return f"⚠️ Attention: {lv_text}, {csp_text}"
     else:
         return f"✅ Normal: {lv_text}, {csp_text}"
-
