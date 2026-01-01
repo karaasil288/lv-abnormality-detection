@@ -1,8 +1,6 @@
 # ================================
-# Fetal Brain Analysis Streamlit App
+# 0) Imports & Model Load
 # ================================
-
-import streamlit as st
 import os
 import io
 import math
@@ -10,28 +8,27 @@ import traceback
 import cv2
 import numpy as np
 import tensorflow as tf
+import ipywidgets as widgets
+from IPython.display import display, clear_output, HTML
 from PIL import Image, ImageDraw
 
 # ================================
-# PART 0: Load UNet model
+# 1) Load your UNet model
 # ================================
-
-UNET_PATH = "fetal_unet_model.h5"  # put your model in the same folder or adjust path
+UNET_PATH = "/content/drive/MyDrive/fetal_unet_model.h5"
 if not os.path.exists(UNET_PATH):
-    st.error(f"Model not found at {UNET_PATH}. Upload your fetal_unet_model.h5 to this path or change UNET_PATH.")
-    st.stop()
+    raise FileNotFoundError(f"Model not found at {UNET_PATH}.")
 
 unet_model = tf.keras.models.load_model(UNET_PATH, compile=False)
-st.success(f"✅ UNet model loaded from: {UNET_PATH}")
+print("✅ UNet model loaded from:", UNET_PATH)
 
 # ================================
-# PART 1: Constants & Helpers
+# 2) Constants & Helpers
 # ================================
-
 IMG_SIZE = 256
 COLORS = {1: (0, 0, 255), 2: (0, 255, 255), 3: (255, 0, 0)}
 
-# Intergrowth table
+# Intergrowth table (simplified, same as before)
 INTERGROWTH_HC = {
     14: (87.38, 88.69, 90.73, 97.88, 105.02, 107.06, 108.37),
     15: (99.22,100.61,102.78,110.37,117.97,120.13,121.53),
@@ -63,8 +60,8 @@ INTERGROWTH_HC = {
 }
 
 def interp_intergrowth(ga_weeks):
-    if ga_weeks < 14.0: ga_weeks = 14.0
-    if ga_weeks > 40.0: ga_weeks = 40.0
+    if ga_weeks < 14: ga_weeks = 14
+    if ga_weeks > 40: ga_weeks = 40
     low, high = int(math.floor(ga_weeks)), int(math.ceil(ga_weeks))
     if low == high:
         vals = INTERGROWTH_HC[low]
@@ -90,9 +87,8 @@ def hc_to_z_percentile(hc_mm, ga_weeks):
     return {'z': z, 'pct': pct, 'median': p50, 'sd': sd, 'centiles': cent}
 
 # ================================
-# PART 2: HC & CSP/LV Helpers
+# 3) HC & CSP/LV Helpers
 # ================================
-
 def calculate_hc_from_segmentation(mask, pixel_size_mm, original_height=None):
     brain_mask = (mask == 1).astype(np.uint8)
     if np.sum(brain_mask) == 0: return 0.0, None, None
@@ -139,116 +135,186 @@ def apply_unet_for_hc(image_bgr, pixel_size_mm):
 
 def apply_unet_for_csp_ventricles(image_array):
     image_resized = cv2.resize(image_array, (IMG_SIZE, IMG_SIZE))
-    image_norm = image_resized.astype(np.float32) / 255.0
-    image_input = np.expand_dims(image_norm, 0)
-    pred_mask = unet_model.predict(image_input, verbose=0)[0]
+    image_norm = image_resized.astype(np.float32)/255.0
+    pred_mask = unet_model.predict(np.expand_dims(image_norm,0), verbose=0)[0]
     pred_mask = np.argmax(pred_mask, axis=-1).astype(np.uint8)
     mask_color = np.zeros((IMG_SIZE, IMG_SIZE, 3), np.uint8)
-    for cls, col in COLORS.items(): mask_color[pred_mask == cls] = col
-    overlay = cv2.addWeighted(image_resized, 0.6, mask_color, 0.4, 0)
-    lv_pixels = np.sum(pred_mask == 3)
-    csp_pixels = np.sum(pred_mask == 2)
+    for cls, col in COLORS.items(): mask_color[pred_mask==cls] = col
+    overlay = cv2.addWeighted(image_resized,0.6,mask_color,0.4,0)
+    lv_pixels = np.sum(pred_mask==3)
+    csp_pixels = np.sum(pred_mask==2)
     return image_resized, mask_color, overlay, lv_pixels, csp_pixels
 
 def analyse_anomalies(csp_pixels, lv_pixels, week, pixel_to_mm):
+    # Logic same as original code
     pixel_size_mm = pixel_to_mm
-    lv_area_mm2 = lv_pixels * (pixel_size_mm ** 2)
-    lv_diameter_mm = 2 * np.sqrt(lv_area_mm2 / np.pi) if lv_pixels > 0 else 0
-    csp_area_mm2 = csp_pixels * (pixel_size_mm ** 2)
-    csp_diameter_mm = 2 * np.sqrt(csp_area_mm2 / np.pi) if csp_pixels > 0 else 0
+    lv_area_mm2 = lv_pixels * (pixel_size_mm**2)
+    lv_diameter_mm = 2*np.sqrt(lv_area_mm2/np.pi) if lv_pixels>0 else 0
+    csp_area_mm2 = csp_pixels * (pixel_size_mm**2)
+    csp_diameter_mm = 2*np.sqrt(csp_area_mm2/np.pi) if csp_pixels>0 else 0
     diagnostics = []
-    status = "NORMAL"
-    status_color = "green"
-    # --- CSP and LV analysis logic (same as Colab) ---
-    # ... keep all rules exactly same (omitted here for brevity in example) ...
+    status = "NORMAL"; status_color = "green"
+
+    # CSP analysis
+    if week < 16:
+        diagnostics.append(f"ℹ️ Âge très précoce ({week} semaines)")
+        diagnostics.append("→ CSP normalement NON visible avant 16-18 semaines")
+        status = "NORMAL"
+        status_color = "green"
+    elif week>=16 and week<18:
+        if csp_pixels==0:
+            diagnostics.append(f"ℹ️ Âge gestationnel: {week} semaines")
+            diagnostics.append("→ CSP peut être visible ou non à cet âge")
+            diagnostics.append("→ Contrôle recommandé à 18-20 semaines")
+            status="SUIVI RECOMMANDÉ"
+            status_color="orange"
+        else:
+            diagnostics.append(f"✅ CSP visible précocement: {csp_diameter_mm:.1f} mm")
+    elif week>=18 and week<=37:
+        if csp_pixels==0:
+            status="ANORMAL"
+            status_color="red"
+            diagnostics.append("❌ CSP NON VISIBLE (18-37 sem)")
+            diagnostics.append("→ SUSPICION DE MALFORMATION")
+            diagnostics.append("  • Agénésie du corps calleux (ACC)")
+            diagnostics.append("  • Holoprosencéphalie (HPE)")
+            diagnostics.append("  • Dysplasie septo-optique (SOD)")
+        else:
+            diagnostics.append(f"✅ CSP visible: {csp_diameter_mm:.1f} mm")
+            if csp_diameter_mm<2 or csp_diameter_mm>8.5:
+                diagnostics.append(f"⚠️ Taille CSP inhabituelle: {csp_diameter_mm:.1f} mm")
+                if status!="ANORMAL": status="ATTENTION"; status_color="orange"
+    else:
+        diagnostics.append(f"✅ CSP encore visible: {csp_diameter_mm:.1f} mm")
+
+    # LV analysis
+    if lv_pixels>0:
+        if lv_diameter_mm>=10:
+            if status!="ANORMAL": status="ANORMAL"; status_color="red"
+            diagnostics.append(f"⚠️ VENTRICULOMÉGALIE détectée")
+            diagnostics.append(f"→ Diamètre ventriculaire: {lv_diameter_mm:.1f} mm (≥ 10 mm)")
+            if lv_diameter_mm<13: diagnostics.append("→ Classification: Légère/Borderline (10-12 mm)")
+            elif lv_diameter_mm<15: diagnostics.append("→ Classification: Modérée (13-15 mm)")
+            else: diagnostics.append("→ Classification: Sévère (>15 mm)")
+        else:
+            diagnostics.append(f"✅ Ventricules latéraux normaux: {lv_diameter_mm:.1f} mm")
+    else:
+        diagnostics.append("ℹ️ Ventricules latéraux non détectés")
+
+    if csp_pixels==0 and lv_diameter_mm>=10 and week>=18:
+        diagnostics.append("📊 PATTERN COMBINÉ: CSP absent + Ventriculomégalie")
+        diagnostics.append("→ Évoque fortement malformation cérébrale structurale")
+
+    if week<18 and csp_pixels==0:
+        diagnostics.append("📋 RECOMMANDATION: Contrôle à 18-20 semaines")
+
     return diagnostics, status, status_color, lv_diameter_mm, csp_diameter_mm
 
 # ================================
-# PART 3: Streamlit UI
+# 4) UI Widgets
 # ================================
+image_uploader = widgets.FileUpload(description="Upload Ultrasound", accept='.jpg,.jpeg,.png,.bmp,.tif', multiple=False)
+pixel_input = widgets.FloatText(description="Pixel size (mm):", value=0.219544094, step=0.0001)
+ga_input = widgets.FloatText(description="Gest. age (wks):", value=28.0, step=0.1)
+process_button = widgets.Button(description="Process & Analyze", button_style='success', icon='play')
 
-st.set_page_config(page_title="Fetal Brain Analysis", layout="wide")
-st.markdown("<h1 style='text-align:center; color:#4a6fa5;'>🧠 Fetal Brain Analysis System</h1>", unsafe_allow_html=True)
-st.markdown("<p style='text-align:center;'>UNet Segmentation • HC Measurement • CSP/Ventricular Analysis</p>", unsafe_allow_html=True)
+hc_output = widgets.Output()
+hc_image_display = widgets.Output()
+csp_output = widgets.Output()
+csp_diagnostic_display = widgets.Output()
 
-# Sidebar inputs
-st.sidebar.header("Upload & Parameters")
-uploaded_file = st.sidebar.file_uploader("Upload Ultrasound Image", type=['jpg','jpeg','png','bmp','tif'])
-pixel_size = st.sidebar.number_input("Pixel size (mm)", value=0.219544094, step=0.0001)
-ga_weeks = st.sidebar.number_input("Gestational age (weeks)", value=28.0, step=0.1)
-process_btn = st.sidebar.button("Process & Analyze")
+# ================================
+# 5) Processing callback
+# ================================
+def on_process(b):
+    with hc_output: clear_output()
+    with hc_image_display: clear_output()
+    with csp_output: clear_output()
+    with csp_diagnostic_display: clear_output()
 
-# Main columns for outputs
-hc_col, csp_col = st.columns([2, 3])
+    if not image_uploader.value:
+        with hc_output: print("❌ No image selected"); return
 
-if process_btn:
-    if uploaded_file is None:
-        st.sidebar.error("❌ Please upload an image first!")
-    else:
-        try:
-            pil = Image.open(uploaded_file).convert("RGB")
-            img_rgb = np.array(pil)
-            img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
+    try:
+        # Load image
+        name = list(image_uploader.value.keys())[0]
+        data = image_uploader.value[name]["content"]
+        pil = Image.open(io.BytesIO(data)).convert("RGB")
+        img_rgb = np.array(pil)
+        img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
 
-            # --- HC measurement ---
-            img_resized_hc, mask_color_hc, overlay_hc, pred_mask_hc, hc_mm, unique_classes = apply_unet_for_hc(img_bgr, pixel_size)
-            ig = hc_to_z_percentile(hc_mm, ga_weeks) if hc_mm>0 else None
+        pixel_size = float(pixel_input.value)
+        ga_weeks = float(ga_input.value)
 
-            # Compose HC visualization grid
-            def make_info_tile_hc():
-                info_tile = np.zeros((320, 320, 3), dtype=np.uint8)
-                info_tile[:] = (30, 30, 30)
-                info_pil = Image.fromarray(info_tile)
-                draw = ImageDraw.Draw(info_pil)
-                draw.text((10, 10), "HC Measurement Results", fill=(255,255,255))
-                draw.text((10, 40), f"HC (mm): {hc_mm:.1f}" if hc_mm>0 else "HC (mm): N/A", fill=(200,200,200))
-                if ig:
-                    draw.text((10,70), f"Intergrowth median: {ig['median']:.1f} mm", fill=(200,200,200))
-                    draw.text((10,100), f"z-score: {ig['z']:.2f}", fill=(0,255,0) if -2<ig['z']<2 else (255,165,0))
-                    draw.text((10,130), f"percentile: {ig['pct']:.1f}th", fill=(255,255,0))
-                return np.array(info_pil)
+        # -------------------------------
+        # HC Measurement
+        # -------------------------------
+        with hc_output:
+            print(f"📄 Processing: {name}")
+            print(f"   Pixel size (mm): {pixel_size:.6f}")
+            print(f"   Gestational age (wks): {ga_weeks:.2f}")
+            print("🔍 Running HC segmentation and measurements...")
 
-            orig_tile = cv2.resize(cv2.cvtColor(img_resized_hc, cv2.COLOR_BGR2RGB),(320,320))
-            seg_tile = cv2.resize(cv2.cvtColor(mask_color_hc, cv2.COLOR_BGR2RGB),(320,320))
-            ov_tile = cv2.resize(cv2.cvtColor(overlay_hc, cv2.COLOR_BGR2RGB),(320,320))
-            info_tile = make_info_tile_hc()
-            top_row_hc = np.hstack([orig_tile, seg_tile])
-            bottom_row_hc = np.hstack([ov_tile, info_tile])
-            final_hc = np.vstack([top_row_hc, bottom_row_hc])
-            hc_col.image(final_hc, caption="HC Measurement", use_column_width=True)
+        img_resized_hc, mask_color_hc, overlay_hc, pred_mask_hc, hc_mm, unique_classes = apply_unet_for_hc(img_bgr, pixel_size)
+        ig = hc_to_z_percentile(hc_mm, ga_weeks) if hc_mm>0 else None
 
-            # --- CSP & LV analysis ---
-            original_csp, mask_img_csp, overlay_csp, lv_pixels, csp_pixels = apply_unet_for_csp_ventricles(img_bgr)
-            diagnostics, status, status_color, lv_diameter_mm, csp_diameter_mm = analyse_anomalies(
-                csp_pixels, lv_pixels, ga_weeks, pixel_size
-            )
+        # Display verbose Colab-style output
+        with hc_output:
+            print("\n" + "="*60)
+            print("✅ HC MEASUREMENT RESULTS")
+            print("="*60)
+            print(f"Head Circumference: {hc_mm:.1f} mm" if hc_mm>0 else "Head Circumference: N/A")
+            if ig:
+                print(f"Intergrowth median @ {ga_weeks:.2f} wks: {ig['median']:.1f} mm")
+                print(f"z-score: {ig['z']:.2f}")
+                print(f"percentile: {ig['pct']:.1f}th")
+                if ig['z']<=-3: print("⚠ Microcephaly (<= -3 SD)")
+                elif ig['z']<=-2: print("⚠ Small head (<= -2 SD)")
+                elif ig['z']>=2: print("⚠ Macrocephaly (>= +2 SD)")
+                else: print("Within normal range")
+            print(f"Segmentation classes seen: {unique_classes}")
+            print("="*35)
 
-            # Compose CSP visualization
-            o_csp = cv2.cvtColor(original_csp, cv2.COLOR_BGR2RGB)
-            m_csp = cv2.cvtColor(mask_img_csp, cv2.COLOR_BGR2RGB)
-            ov_csp = cv2.cvtColor(overlay_csp, cv2.COLOR_BGR2RGB)
-            o_csp = cv2.resize(o_csp, (300, 300))
-            m_csp = cv2.resize(m_csp, (300, 300))
-            ov_csp = cv2.resize(ov_csp, (300, 300))
-            top_csp = np.hstack([o_csp, m_csp])
-            bot_csp = np.hstack([ov_csp, np.zeros((300,300,3), np.uint8)])
-            final_csp = np.vstack([top_csp, bot_csp])
-            csp_col.image(final_csp, caption="CSP & LV Analysis", use_column_width=True)
+        with hc_image_display:
+            display(HTML(f"<h4>HC Segmentation Overlay</h4>"))
+            display(Image.fromarray(cv2.cvtColor(overlay_hc, cv2.COLOR_BGR2RGB)))
 
-            # Display HTML diagnostic
-            diag_html = f"""
-            <div style="border:2px solid {status_color}; padding:15px; border-radius:10px; background-color:#f8f9fa;">
-            <h3 style="color:{status_color};">DIAGNOSTIC: {status}</h3>
-            <p>Gestational age: {ga_weeks} weeks</p>
-            <p>LV diameter: {lv_diameter_mm:.1f} mm</p>
-            <p>CSP diameter: {csp_diameter_mm:.1f} mm</p>
-            <ul>
-            """
-            for msg in diagnostics:
-                diag_html += f"<li>{msg}</li>"
-            diag_html += "</ul></div>"
-            st.markdown(diag_html, unsafe_allow_html=True)
+        # -------------------------------
+        # CSP & LV Analysis
+        # -------------------------------
+        img_resized_csp, mask_color_csp, overlay_csp, lv_pixels, csp_pixels = apply_unet_for_csp_ventricles(img_bgr)
+        diagnostics, status, status_color, lv_diameter_mm, csp_diameter_mm = analyse_anomalies(csp_pixels, lv_pixels, ga_weeks, pixel_size)
 
-        except Exception as e:
-            st.error("❌ Error during processing:")
-            st.text(traceback.format_exc())
+        with csp_output:
+            print("\n" + "="*60)
+            print("✅ CSP & VENTRICULAR ANALYSIS RESULTS")
+            print("="*60)
+            print(f"STATUS: {status}")
+            print(f"Ventricular diameter (LV): {lv_diameter_mm:.1f} mm")
+            print(f"CSP diameter: {csp_diameter_mm:.1f} mm")
+            print(f"Gestational age: {ga_weeks:.1f} weeks")
+            print("\nDETAILS:")
+            print("-"*40)
+            for d in diagnostics: print("  ", d)
+            print("="*60)
+
+        with csp_diagnostic_display:
+            display(HTML(f"<h4 style='color:{status_color}'>{status} Diagnostic</h4>"))
+            display(Image.fromarray(cv2.cvtColor(overlay_csp, cv2.COLOR_BGR2RGB)))
+            display(HTML("<b>Detailed analysis:</b><br>" + "<br>".join(diagnostics)))
+
+    except Exception as e:
+        with hc_output:
+            print("❌ Error processing image:", e)
+            traceback.print_exc()
+
+process_button.on_click(on_process)
+
+# ================================
+# 6) Display UI
+# ================================
+display(widgets.VBox([
+    widgets.HTML("<h2 style='color:green'>Fetal Head & Ventricular Analysis App</h2>"),
+    image_uploader, pixel_input, ga_input, process_button,
+    hc_output, hc_image_display, csp_output, csp_diagnostic_display
+]))
