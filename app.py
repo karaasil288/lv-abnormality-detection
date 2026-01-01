@@ -1,48 +1,99 @@
 import streamlit as st
 import numpy as np
+import cv2
 from PIL import Image
+from model_utils import load_model, preprocess_image, predict_mask, analyze_lv
 
-from model_utils import (
-    load_model,
-    preprocess_image,
-    predict_mask,
-    clean_mask,
-    analyze_lv
-)
-
+# =======================
+# Page Config
+# =======================
 st.set_page_config(
     page_title="Fetal Brain Abnormality Detection",
-    layout="centered"
+    layout="wide",
+    page_icon="🧠"
 )
 
 st.title("🧠 Fetal Brain Abnormality Detection")
-st.write("Upload an ultrasound image to analyze fetal brain structures.")
+st.write(
+    "Upload an ultrasound image to analyze fetal brain structures (LV, CSP) and detect abnormalities."
+)
 
+# =======================
+# Load Model
+# =======================
 @st.cache_resource
 def load_unet():
-    return load_model("fetal_unet_model.h5")
+    model = load_model("fetal_unet_model.h5")
+    return model
 
 model = load_unet()
 
+# =======================
+# Upload Image
+# =======================
 uploaded_file = st.file_uploader(
-    "Upload ultrasound image",
+    "Upload an ultrasound image",
     type=["png", "jpg", "jpeg"]
 )
 
+# =======================
+# Main Processing
+# =======================
 if uploaded_file is not None:
     image = Image.open(uploaded_file).convert("RGB")
     image_np = np.array(image)
 
-    st.image(image, caption="Original Image", use_container_width=True)
+    st.subheader("Original Image")
+    st.image(image, use_column_width=True)
 
+    # Preprocess for model
     input_image = preprocess_image(image_np)
     mask = predict_mask(model, input_image)
-    mask = clean_mask(mask)
 
-    st.subheader("Predicted Segmentation Mask")
-    st.image(mask, use_container_width=True)
+    # =======================
+    # Colorize mask
+    # =======================
+    IMG_SIZE = mask.shape[0]
+    COLORS = {1: (0, 0, 255), 2: (0, 255, 255), 3: (255, 0, 0)}
+    mask_color = np.zeros((IMG_SIZE, IMG_SIZE, 3), np.uint8)
+    for cls, col in COLORS.items():
+        mask_color[mask == cls] = col
 
-    diagnosis = analyze_lv(mask)
+    overlay = cv2.addWeighted(cv2.resize(image_np, (IMG_SIZE, IMG_SIZE)), 0.6, mask_color, 0.4, 0)
 
-    st.subheader("🩺 Medical Interpretation")
-    st.success(diagnosis)
+    # =======================
+    # Tabs for display
+    # =======================
+    tabs = st.tabs(["Segmentation Mask", "Overlay", "Medical Interpretation"])
+
+    with tabs[0]:
+        st.subheader("Predicted Segmentation Mask")
+        st.image(mask_color, use_column_width=True)
+
+    with tabs[1]:
+        st.subheader("Overlay Image (Mask + Original)")
+        st.image(overlay, use_column_width=True)
+
+    with tabs[2]:
+        st.subheader("Medical Interpretation")
+
+        # LV and CSP analysis
+        diagnosis = analyze_lv(mask)
+        lv_pixels = np.sum(mask == 3)
+        csp_pixels = np.sum(mask == 2)
+
+        col1, col2 = st.columns(2)
+        with col1:
+            st.metric("LV pixels", lv_pixels)
+            st.metric("CSP pixels", csp_pixels)
+        with col2:
+            st.success(diagnosis)
+
+        st.write("**Legend:**")
+        st.markdown(
+            """
+            - 🟥 Red: Lateral Ventricles (LV)
+            - 🟨 Yellow: CSP
+            - 🟦 Blue: Brain structure / other
+            """
+        )
